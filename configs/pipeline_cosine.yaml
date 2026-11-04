@@ -1,0 +1,24 @@
+method: "lstsq" # "cosine" still runs the unported Llama cosine_dist
+model_path: "/home/ubuntu/dev/legalner-gliner2/output/deberta_base_ulysses_s0/best"
+seed: 0 # matches "seed" in the model's experiment_config.json
+dataset: "ulysses"  # or "lener"
+batch_size: 8
+max_length: 512
+dataset_size: 8000
+dataset_subset: "dev"
+use_4bit: False
+save_path: null
+save_transform_only: True
+diag: False # whether to force the LT to be a diagonal matrix
+two_vectors: False # whether to force the LT to be a multiplication of two vectors
+thri: False # whether to force the LT to be a lower triangular matrix
+solver: "adam" # adam, cg, l-bfgs, trust-ncg are supported
+loss: "cosine" # cosine, mse, elasticnet are supported
+distances_path: null
+num_A: 2 #  number of layer blocks to cut out. In total, up to num_A × layers_to_skip layers are removed
+layers_to_skip: 3
+merge_consecutive: True 
+accurate: False # False will run cosine(xA, y - z) where z is the residual attention info, True to run cosine(xA + z, y)
+eval_subset: "test" # CoNLL split scored by the evaluator (calibration uses dataset_subset)
+threshold: 0.5 # entity confidence threshold for batch_extract_entities
+eval_size: null # optional cap on evaluated sentences
