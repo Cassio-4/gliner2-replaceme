@@ -19,7 +19,11 @@ from tqdm import tqdm
 from transformers import BitsAndBytesConfig
 
 from .utils import (compute_block_distances, get_gliner2_calib_dataloader,
+                    get_last_non_padded_tokens,
                     get_text_and_query_indices_tokens, seed_all)
+
+# Accepted values of profile_distances' distance_calculation_tokens
+DISTANCE_CALCULATION_TOKENS = ("first_sub_token", "last_non_pad_token")
 
 # Initialize colorama for Windows compatibility
 init(autoreset=True)
@@ -51,6 +55,7 @@ def profile_distances(
     save_path: Optional[str] = None,
     min_distance_layer: Optional[int] = None,
     token: Optional[str] = None,
+    distance_calculation_tokens: str = "first_sub_token",
 ) -> None:
     """Profile distances between transformer model layers.
 
@@ -67,7 +72,18 @@ def profile_distances(
         save_path: Path to save results (unused)
         min_distance_layer: index of the layer to start cut
         token: Authentication token for private models
+        distance_calculation_tokens: Which token states the layer distances are measured on:
+            "first_sub_token": the tokens GLiNER2's head reads (first sub-token of each text
+                word and the schema [E] markers)
+            "last_non_pad_token": the last non-padded token of each sequence, as in the
+                original ReplaceMe ([SEP] on DeBERTa)
     """
+    if distance_calculation_tokens not in DISTANCE_CALCULATION_TOKENS:
+        raise ValueError(
+            f"distance_calculation_tokens must be one of {DISTANCE_CALCULATION_TOKENS}, "
+            f"got {distance_calculation_tokens!r}"
+        )
+
     device_map = "auto" if torch.cuda.is_available() else "cpu"
     quantization_config = None
 
@@ -118,23 +134,24 @@ def profile_distances(
         with torch.no_grad():
             outputs = model(**inputs)
 
-        # Get non-padded tokens and compute distances
-        attention_mask = inputs["attention_mask"]
         hidden_states = outputs.hidden_states
-        """
-        last_non_padded_hidden_states = get_last_non_padded_tokens(
-            hidden_states, attention_mask
-        )
-        last_non_padded_hidden_states = last_non_padded_hidden_states[1:]
-        """
-        valid_non_padded_hidden_states = get_text_and_query_indices_tokens(
-            hidden_states, batch["text_word_indices"], batch["text_word_mask"],
-            batch["query_marker_indices"], batch["query_marker_mask"],
-        )
-        valid_non_padded_hidden_states = valid_non_padded_hidden_states[1:]
+        if distance_calculation_tokens == "first_sub_token":
+            # Only the tokens GLiNER2's head reads: first sub-token of each word + [E] markers,
+            # flattened to (num_valid_tokens, hidden)
+            selected_hidden_states = get_text_and_query_indices_tokens(
+                hidden_states, batch["text_word_indices"], batch["text_word_mask"],
+                batch["query_marker_indices"], batch["query_marker_mask"],
+            )
+        elif distance_calculation_tokens == "last_non_pad_token":
+            # Original ReplaceMe: one token per sequence, which is [SEP] on DeBERTa
+            selected_hidden_states = get_last_non_padded_tokens(
+                hidden_states, inputs["attention_mask"]
+            )
+        # Drop the embedding output so index l is the output of layer l + 1
+        selected_hidden_states = selected_hidden_states[1:]
 
         distances = compute_block_distances(
-            valid_non_padded_hidden_states, layers_to_skip
+            selected_hidden_states, layers_to_skip
         )
 
         for i, distance in enumerate(distances):

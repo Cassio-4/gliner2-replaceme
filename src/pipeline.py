@@ -1,6 +1,8 @@
 import argparse
+import glob
 import inspect
 import logging
+import os
 
 import torch
 import yaml
@@ -23,7 +25,16 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
+def save_experiment_config(config, model_dir):
+    # Not "config.json": the model's own config already uses that name
+    config_path = os.path.join(model_dir, "pipeline_config.yaml")
+    with open(config_path, 'w') as f:
+        yaml.safe_dump(config, f, sort_keys=False)
+    logging.info(f"Saved experiment config to {config_path}")
+
 def ReplaceMe_pipeline(config):
+    # Snapshot before distances_path is overwritten below, so the saved config matches the input
+    experiment_config = dict(config)
     # Extract the relevant parameters based on function signatures
     signature = inspect.signature(profile_distances)
     filtered_config = {k: v for k, v in config.items() if k in signature.parameters}
@@ -60,6 +71,14 @@ def ReplaceMe_pipeline(config):
             path = cosine_dist(**filtered_config, start_id=start_ids[i], end_id=end_ids[i], num_layer=num_layers[i])
             filtered_config["model_path"] = path
     
+    # Save before evaluating, so the config is kept even if evaluation fails
+    save_experiment_config(experiment_config, path)
+
+    # The model was just rewritten, so results from an earlier run in this directory are stale
+    # and eval_model would otherwise return them as cached
+    for stale_result in glob.glob(os.path.join(glob.escape(path), "benchmark_*.json")):
+        os.remove(stale_result)
+
     # Evaluate using the updated configuration
     signature = inspect.signature(evaluator)
     filtered_config = {k: v for k, v in config.items() if k in signature.parameters}
@@ -81,7 +100,8 @@ def run_from_config():
     # Execute pipeline based on parsed configuration
     args = parser.parse_args()
     config = read_config(args.config)
-    seed_all(config.pop("seed", 42))
+    # Keep the seed in the config, including the default, so it gets saved with the experiment
+    seed_all(config.setdefault("seed", 42))
     ReplaceMe_pipeline(config)
 
 def main() -> None:

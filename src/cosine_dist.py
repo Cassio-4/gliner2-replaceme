@@ -4,13 +4,13 @@ import logging
 import os
 from typing import Optional
 import torch
-import yaml
+import yaml     
 from colorama import Fore, init
+from gliner2 import AutoExtractor
 from tqdm import tqdm
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           BitsAndBytesConfig)
-
-from .utils import (adam_method, get_calib_dataloader, optimizing_method,
+from .utils import (adam_method, get_gliner2_calib_dataloader, optimizing_method,
                     select_non_overlapping_blocks, truncate_model, seed_all)
 
 # Initialize colorama for Windows compatibility
@@ -29,12 +29,11 @@ seed_all()
 def cosine_dist(
     model_path: str,
     dataset: str,
-    dataset_column: str,
     batch_size: int,
     max_length: int,
     layers_to_skip: int,
     dataset_size: Optional[int] = None,
-    dataset_subset: Optional[str] = "eval",
+    dataset_subset: Optional[str] = "dev",
     activations_save_path: Optional[str] = None,
     use_4bit: bool = False,
     save_path: Optional[str] = None,
@@ -53,7 +52,6 @@ def cosine_dist(
     num_A: int = 1,
     merge_consecutive: bool = True,
     accurate: bool= False
-    
 ) -> str:
     """Calculate cosine distance between model layers and apply transformations.
     
@@ -83,7 +81,8 @@ def cosine_dist(
         distances_path: Path to save distance metrics
         num_A: Number of LT transforms
         merge_consecutive: Whether to merge consecutive LT transforms
-    
+        accurate: Whether to fit cosine(xA + z, y) instead of cosine(xA, y - z)
+
     Returns:
         Path where transformed model is saved
     """
@@ -98,46 +97,45 @@ def cosine_dist(
             bnb_4bit_compute_dtype=torch.bfloat16
         )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        device_map=device_map,
-        quantization_config=quantization_config,
-        output_hidden_states=True,
-        token=token
-    )
+    # Load model and tokenizer
+    # Load GLiNER2 model and profile its HF encoder (e.g. DebertaV2Model)
+    extractor = AutoExtractor.from_pretrained(model_path)
+    extractor.to("cuda" if torch.cuda.is_available() else "cpu")
+    extractor.eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    hidden_size = model.config.hidden_size
-    
-    if not tokenizer.pad_token:
-        tokenizer.pad_token = tokenizer.eos_token
-    
+    model = extractor.encoder
+    model.config.output_hidden_states = True
     model.eval()
-    dataloader = get_calib_dataloader(
+    
+    dataloader = get_gliner2_calib_dataloader(
+        extractor,
         dataset,
         dataset_subset,
-        dataset_column,
         dataset_size,
         batch_size,
-        tokenizer
-    )
+        max_len=max_length
+        )
     
-    def save_mlp_activation(name):
-        """Returns a hook function that saves the module output under the key 'name'."""
+     # Setup activation hooks
+    def save_mlp_activation(name: str):
+        """Returns a hook function that saves module outputs."""
         def hook(module, input, output):
-            # Detach to avoid keeping computation history
             mlp_activations[name] = output.detach()
         return hook
-
+    
     hooks = []
-    if 'falcon' in model_path.lower():
-        for i, layer in enumerate(model.transformer.h):
-            hooks.append(layer.mlp.register_forward_hook(save_mlp_activation(f'layer_{i}_mlp')))
-    else:
-        for i, layer in enumerate(model.model.layers):
-            hooks.append(layer.mlp.register_forward_hook(save_mlp_activation(f'layer_{i}_mlp')))
-
     mlp_activations = {}
+    # DebertaV2Layer: attention -> intermediate (dense+GELU) -> output (dense -> dropout -> LayerNorm(x + residual)).
+    # output.dense is the FFN down-projection, i.e. the counterpart of Llama's mlp.down_proj (pre-residual, pre-LN).
+    # Per layer k:  A_k = attention.output(...)            (already LayerNorm'd, the residual into the FFN block)
+    #               M_k = output.dense(GELU(W1 A_k))        <- this hook captures M_k
+    #               h_k = output.LayerNorm(M_k + A_k)       <- what outputs.hidden_states[k + 1] holds
+    # A_k itself is never captured, and neither is the LayerNorm input M_k + A_k.
+    for i, layer in enumerate(model.encoder.layer):
+        hooks.append(layer.output.dense.register_forward_hook(save_mlp_activation(f'layer_{i}_mlp')))    
+    
+    hidden_size = model.config.hidden_size
+
     a1 = torch.empty(
         (dataset_size * max_length, model.config.hidden_size),
         dtype=torch.bfloat16,
@@ -163,34 +161,45 @@ def cosine_dist(
         dynamic_ncols=True,
         colour="red"
     ):
-        inputs = tokenizer(
-            batch,
-            return_tensors="pt",
-            padding="longest",
-            max_length=max_length,
-            truncation=True
-        )
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        batch = {k: v.to(model.device) for k, v in batch.items()}
+        inputs = {k: batch[k] for k in ("input_ids", "attention_mask")}
         
         with torch.no_grad():
             outputs = model(**inputs)
         
+        # After [1:], hidden_states[k] is the output of 0-based layer k. With idx_i = start_id - num_layer - 1
+        # (the last layer that is KEPT) and idx_n = end_id - num_layer - 1 (the last layer that is REMOVED),
+        # the block idx_i+1 .. idx_n is cut, and the goal is: new output of layer idx_i ≈ h_n.
+        # num_layer shifts the ids when earlier blocks were already cut from model_path.
         hidden_states = outputs.hidden_states[1:]
         hidden_states_mlp_list = [
             mlp_activations[f'layer_{i}_mlp'] for i in range(model.config.num_hidden_layers)
         ]
         hidden_states_mlp = hidden_states_mlp_list[start_id - num_layer - 1]
 
+        hidden_states_i = hidden_states[start_id - num_layer - 1]
+        hidden_states_n = hidden_states[end_id - num_layer - 1]
+
         # Reshape activations
-        hidden_states_mlp = hidden_states_mlp.view(-1, hidden_size).to(torch.float64)
-        hidden_states_i = hidden_states[start_id - num_layer - 1].view(-1, hidden_size).to(torch.float64)
-        hidden_states_n = hidden_states[end_id - num_layer - 1].view(-1, hidden_size).to(torch.float64)
+        hidden_states_mlp = hidden_states_mlp.reshape(-1, hidden_size).to(torch.float64)
+        hidden_states_i = hidden_states_i.reshape(-1, hidden_size).to(torch.float64)
+        hidden_states_n = hidden_states_n.reshape(-1, hidden_size).to(torch.float64)
         
+        # Residual math inherited from ReplaceMe's Llama (pre-norm) code. There, h_i = r_i + M_i, where r_i
+        # is the residual stream after attention, so h_i - M_i recovers r_i exactly. The fit then targets
+        #   non-accurate: cosine(M_i T, h_n - r_i)    -> a1 = M_i, a2 = h_n + M_i - h_i
+        #   accurate:     cosine(M_i T + r_i, h_n)    -> a1 = M_i, a2 = h_n,  a3 = h_i - M_i
+        # DeBERTa is post-LN: h_i = LN_i(M_i + A_i). So h_i - M_i = LN_i(M_i + A_i) - M_i, which is NOT the
+        # residual A_i: it mixes a normalized vector with an unnormalized one. Both a2 (non-accurate) and a3
+        # (accurate) are therefore built from this wrong residual. Also, after the fold below the new layer
+        # output is LN_i(M_i T + A_i): the LayerNorm sits after the sum, yet the loss compares
+        # M_i T (+ a3) directly with h_n, which is an LN output. The loss does not model the actual
+        # post-pruning forward pass.
         a1_batch = hidden_states_mlp
         a2_batch = hidden_states_n + hidden_states_mlp - hidden_states_i
         if accurate:
-            a2_batch = hidden_states_n 
-            a3_batch = hidden_states_i - hidden_states_mlp 
+            a2_batch = hidden_states_n
+            a3_batch = hidden_states_i - hidden_states_mlp
             a3[cnt:cnt+a3_batch.shape[0]] = a3_batch
         a1[cnt:cnt+a1_batch.shape[0]] = a1_batch
         a2[cnt:cnt+a2_batch.shape[0]] = a2_batch
@@ -212,34 +221,41 @@ def cosine_dist(
     del model
     gc.collect()
     torch.cuda.empty_cache()
+
+     # Load fresh GLiNER2 model for transformation (kept in FP32: GLiNER2 heads expect FP32 encoder outputs)
+    del extractor
+    extractor = AutoExtractor.from_pretrained(model_path)
+    extractor.to("cpu")
+    extractor.eval()
+    model = extractor.encoder
     
-    # Reload model for transformation
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        device_map='cpu',
-        torch_dtype=torch.bfloat16
-    )
+    # Removes 0-based layers [idx_i + 1, idx_n + 1); layer idx_i is kept and now feeds layer idx_n + 1 directly
     model = truncate_model(model, start_id - num_layer, end_id - num_layer)
     
+    # Save results
     if save_path is None:
-        if not os.path.exists('output_models'):
-            os.mkdir('output_models')
-        save_path = "output_models/" + (
-            f"{model_path}_{layers_to_skip}_layers_{start_id}_"
-            f"{end_id}_{dataset}_{dataset_size}"
-        ).replace("/", "_")
+        os.makedirs('output_models', exist_ok=True)
+        save_path = os.path.join(
+            "output_models",
+            f"{model_path}_{layers_to_skip}_layers_{start_id}_{end_id}_{dataset}_{dataset_size}".replace("/", "_")
+        )
     
-    # Apply transformation
-    model.model.layers[start_id - num_layer - 1].mlp.down_proj.load_state_dict({
-        "weight": (transform.T.cpu() @ model.model.layers[start_id - num_layer - 1].mlp.down_proj.weight.to(torch.float64)).to(torch.bfloat16)
+    # Apply transformation: fold T into layer idx_i's FFN down-projection, so that dense'(x) = dense(x) T.
+    # Layer idx_i then outputs LN_i(M_i T + A_i). LN_i keeps its own gamma/beta, while the target h_n was
+    # produced by LN_n's gamma/beta.
+    dense = extractor.encoder.encoder.layer[start_id - num_layer - 1].output.dense
+    transform_t = transform.T.cpu()
+    dense.load_state_dict({
+        "weight": (transform_t @ dense.weight.to(torch.float64)).to(dense.weight.dtype),
+        "bias": (transform_t @ dense.bias.to(torch.float64)).to(dense.bias.dtype)
     })
-    
-    model.save_pretrained(f"{save_path}_ReplaceMe_{loss}_{solver}")
-    tokenizer.save_pretrained(f"{save_path}_ReplaceMe_{loss}_{solver}")
-    
+
+    # Writes config.json, encoder_config/ (with the reduced num_hidden_layers), model.safetensors and the tokenizer
+    extractor.save_pretrained(f"{save_path}_ReplaceMe_{loss}_{solver}")
+
     if save_transform_only:
         torch.save(transform, f"{save_path}_ReplaceMe_{loss}_{solver}_transform")
-    
+        
     # Final cleanup
     del model, a1, a2
     if accurate:
@@ -286,5 +302,5 @@ def run_from_config():
     num_layers = [sum(num_layers[:i]) for i in range(len(start_ids)+1)]
     
     for i in range(len(selected_blocks)):
-        path = cosine_dist(**config, start_id=start_ids[i], end_id=end_ids[i], num_layer=num_layers[i])
+        path = cosine_dist(**config, start_id=start_ids[i], end_id=end_ids[i], num_layer=num_layers[i], selected_blocks=selected_blocks)
         config["model_path"] = path

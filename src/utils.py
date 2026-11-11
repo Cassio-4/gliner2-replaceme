@@ -447,7 +447,12 @@ def eval_model(
     from gliner2 import AutoExtractor
     from gliner2.training.metrics import f1_from_counts
 
-    result_path = f'benchmark_results/{os.path.basename(os.path.normpath(model_path))}_{dataset}_{eval_subset}.json'
+    if os.path.isdir(model_path):
+        result_path = os.path.join(model_path, f'benchmark_{dataset}_{eval_subset}.json')
+    else:
+        # A Hub model id has no local experiment directory to save into
+        os.makedirs('benchmark_results', exist_ok=True)
+        result_path = f'benchmark_results/{os.path.basename(os.path.normpath(model_path))}_{dataset}_{eval_subset}.json'
     if os.path.exists(result_path):
         with open(result_path) as f:
             return json.load(f)
@@ -494,7 +499,6 @@ def eval_model(
     print(colored(f"{'MICRO AVG':<16}P={micro_p:.3f} R={micro_r:.3f} F1={micro_f1:.3f}", "green"))
     print(colored(f"{'MACRO AVG':<16}F1={results['macro']['f1']:.3f}", "green"))
 
-    os.makedirs('benchmark_results', exist_ok=True)
     with open(result_path, 'w') as f:
         json.dump(results, f, indent=4, ensure_ascii=False)
 
