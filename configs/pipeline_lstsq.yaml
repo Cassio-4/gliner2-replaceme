@@ -1,11 +1,10 @@
-method: "cosine" # "cosine" 
+method: "lstsq"
 model_path: "/home/ubuntu/dev/legalner-gliner2/output/deberta_base_ulysses_s0/best"
 seed: 0 # matches "seed" in the model's experiment_config.json
 dataset: "ulysses"  # or "lener"
 batch_size: 8
 max_length: 512
-dataset_size: 4000
-dataset_subset: "train"
+dataset_subset: "train" # calibration uses every sentence of this split
 use_4bit: False
 save_path: null
 save_transform_only: True

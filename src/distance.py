@@ -48,7 +48,6 @@ def profile_distances(
     batch_size: int,
     max_length: int,
     layers_to_skip: int,
-    dataset_size: Optional[int] = None,
     dataset_subset: Optional[str] = "eval",
     activations_save_path: Optional[str] = None,
     use_4bit: bool = False,
@@ -65,8 +64,7 @@ def profile_distances(
         batch_size: Batch size for processing
         max_length: Maximum sequence length
         layers_to_skip: Number of layers between compared blocks
-        dataset_size: Optional size limit for dataset
-        dataset_subset: Subset of dataset to use (train/eval)
+        dataset_subset: Split to profile on (train/dev/test); all of its texts are used
         activations_save_path: Path to save activations (unused)
         use_4bit: Whether to use 4-bit quantization
         save_path: Path to save results (unused)
@@ -112,7 +110,6 @@ def profile_distances(
         extractor,
         dataset,
         dataset_subset,
-        dataset_size,
         batch_size,
     )
 

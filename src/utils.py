@@ -112,13 +112,12 @@ def get_gliner2_calib_dataloader(
     extractor: nn.Module,
     dataset: str,
     dataset_subset: str,
-    dataset_size: Optional[int],
     batch_size: int,
     max_len: Optional[int] = None,
 ) -> DataLoader:
     """Calibration batches built exactly as GLiNER2's ``batch_extract_entities`` builds them in production.
 
-    Each text is paired with the dataset's entity schema (names + Portuguese descriptions) and
+    Uses every text of the ``dataset_subset`` split (LeNER-Br and UlyssesNER-Br are small). Each text is paired with the dataset's entity schema (names + Portuguese descriptions) and
     collated by the model's own inference collator, so the encoder sees the same
     ``[P] ... [E] label ... [SEP_TEXT] text`` input it was fine-tuned on. Yields dicts holding the
     only two tensors GLiNER2 passes to its encoder, ``input_ids`` and ``attention_mask``, plus the
@@ -136,8 +135,6 @@ def get_gliner2_calib_dataloader(
     if not os.path.exists(path):
         raise FileNotFoundError(f"{path} not found; dataset_subset must be train, dev or test")
     texts = [ex.text for ex in TrainingDataset.load(path)]
-    if dataset_size:
-        texts = texts[:dataset_size]
 
     # Same schema construction and collator as batch_extract_entities -> batch_extract
     schema = extractor.create_schema().entities(entity_types)

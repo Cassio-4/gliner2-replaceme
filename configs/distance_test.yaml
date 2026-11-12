@@ -4,8 +4,7 @@ seed: 0 # matches "seed" in the model's experiment_config.json
 dataset: "ulysses"  # or "lener"
 batch_size: 8
 max_length: 512
-dataset_size: 1000
-dataset_subset: "dev"
+dataset_subset: "dev" # calibration uses every sentence of this split
 use_4bit: False
 save_path: null
 save_transform_only: True

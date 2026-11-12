@@ -42,7 +42,6 @@ def lstsq(
     batch_size: int,
     max_length: int,
     layers_to_skip: int,
-    dataset_size: Optional[int] = None,
     dataset_subset: Optional[str] = "eval",
     activations_save_path: Optional[str] = None,
     use_4bit: bool = False,
@@ -64,8 +63,7 @@ def lstsq(
         batch_size: Batch size for processing
         max_length: Maximum sequence length
         layers_to_skip: Number of layers between compared blocks
-        dataset_size: Optional size limit for dataset
-        dataset_subset: Subset of dataset to use (train/eval)
+        dataset_subset: Split to calibrate on (train/dev/test); all of its texts are used
         activations_save_path: Path to save activations (unused)
         use_4bit: Whether to use 4-bit quantization
         save_path: Path to save transformed model
@@ -106,7 +104,6 @@ def lstsq(
         extractor,
         dataset,
         dataset_subset,
-        dataset_size,
         batch_size,
     )
 
@@ -236,7 +233,7 @@ def lstsq(
         layer_indices_for_name = '__'.join([f"{start_ids[i]}_{end_ids[i]}" for i in range(len(selected_blocks))])
         save_path = os.path.join(
             "output_models",
-            f"{model_path}_{layers_to_skip}_layers_{layer_indices_for_name}_{dataset}_{dataset_size}".replace("/", "_")
+            f"{model_path}_{layers_to_skip}_layers_{layer_indices_for_name}_{dataset}_{dataset_subset}".replace("/", "_")
         )
 
     # Writes config.json, encoder_config/ (with the reduced num_hidden_layers), model.safetensors and the tokenizer
