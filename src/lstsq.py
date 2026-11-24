@@ -54,6 +54,8 @@ def lstsq(
     distances_path: str = "./distances.pth",
     num_A: int = 1,
     merge_consecutive: bool = True,
+    ln_aware_fit: bool = False,
+    exclude_pad_tokens_from_fit: bool = False
 ) -> str:
     """Compute least squares transformations between model layers.
     
@@ -114,12 +116,20 @@ def lstsq(
             mlp_activations[name] = output.detach()
         return hook
 
+    def save_ln_input(name):
+        def hook(module, args, output):
+            ln_inputs[name] = args[0].detach() # pre-LN sum: dense(x) + attention_output
+        return hook
+
     hooks = []
     mlp_activations = {}
+    ln_inputs = {}
     # DebertaV2Layer: attention -> intermediate (dense+GELU) -> output (dense -> dropout -> LayerNorm(x + residual)).
     # output.dense is the FFN down-projection, i.e. the counterpart of Llama's mlp.down_proj (pre-residual, pre-LN).
     for i, layer in enumerate(model.encoder.layer):
         hooks.append(layer.output.dense.register_forward_hook(save_mlp_activation(f'layer_{i}_mlp')))
+        if ln_aware_fit:
+            hooks.append(layer.output.LayerNorm.register_forward_hook(save_ln_input(f'layer_{i}_ln_in')))
 
     # Load precomputed distances and select blocks
     average_distances = torch.load(distances_path)
@@ -146,6 +156,8 @@ def lstsq(
         for _ in range(len(selected_blocks))
     ]
 
+    L = model.config.num_hidden_layers
+
     # Process batches
     for batch in tqdm(
         dataloader,
@@ -155,32 +167,68 @@ def lstsq(
     ):
         batch = {k: v.to(model.device) for k, v in batch.items()}
         inputs = {k: batch[k] for k in ("input_ids", "attention_mask")}
-
+        
         with torch.no_grad():
             outputs = model(**inputs)
 
         hidden_states = outputs.hidden_states[1:]
-        
-        # Get relevant hidden states
-        hidden_states_mlp = [
-            mlp_activations[f'layer_{i}_mlp'].view(-1, hidden_size).to(torch.float64)
-            for i in range(model.config.num_hidden_layers) if i+1 in start_ids
-        ]
-        hidden_states_i = [
-            hidden_states[i].view(-1, hidden_size).to(torch.float64)
-            for i in range(model.config.num_hidden_layers) if i+1 in start_ids
-        ]
-        hidden_states_n = [
-            hidden_states[i].view(-1, hidden_size).to(torch.float64)
-            for i in range(model.config.num_hidden_layers) if i+1 in end_ids
-        ]
+
+        mask = inputs["attention_mask"].reshape(-1).bool()
+
+        def flat(t):
+            return t.reshape(-1, hidden_size)[mask].to(torch.float64)
+        if exclude_pad_tokens_from_fit:
+            hidden_states_mlp = [flat(mlp_activations[f'layer_{i}_mlp']) for i in range(L) if i+1 in start_ids]
+            hidden_states_i   = [flat(hidden_states[i]) for i in range(L) if i+1 in start_ids]
+            hidden_states_n   = [flat(hidden_states[i]) for i in range(L) if i+1 in end_ids]
+        else:
+            # Get relevant hidden states
+            hidden_states_mlp = [
+                mlp_activations[f'layer_{i}_mlp'].view(-1, hidden_size).to(torch.float64)
+                for i in range(model.config.num_hidden_layers) if i+1 in start_ids
+            ]
+            hidden_states_i = [
+                hidden_states[i].view(-1, hidden_size).to(torch.float64)
+                for i in range(model.config.num_hidden_layers) if i+1 in start_ids
+            ]
+            hidden_states_n = [
+                hidden_states[i].view(-1, hidden_size).to(torch.float64)
+                for i in range(model.config.num_hidden_layers) if i+1 in end_ids
+            ]
 
         # Accumulate matrices
         for idx in range(len(selected_blocks)):
             dev = hidden_states_mlp[idx].device
             if idx == 0 or start_ids[idx] != end_ids[idx-1]:
-                a1_batch = hidden_states_mlp[idx].to(dev)
-                a2_batch = hidden_states_n[idx].to(dev) + hidden_states_mlp[idx].to(dev) - hidden_states_i[idx].to(dev)
+                if ln_aware_fit:
+                    k = start_ids[idx] -1 # last kept layer before the cut
+                    if exclude_pad_tokens_from_fit:
+                        z = flat(ln_inputs[f'layer_{k}_ln_in'].reshape(-1, hidden_size).double())
+                    else:
+                        z = ln_inputs[f'layer_{k}_ln_in'].reshape(-1, hidden_size).double()
+                    mlp = hidden_states_mlp[idx]
+                    residual = z - mlp
+
+                    ln = model.encoder.layer[k].output.LayerNorm
+                    gamma, beta = ln.weight.double(), ln.bias.double()
+                    eps_g = 1e-6
+                    gamma = torch.where(
+                        gamma.abs() < eps_g,
+                        torch.where(gamma >= 0, eps_g, -eps_g).to(gamma.dtype),
+                        gamma,
+                    )  # avoid /0, keep sign
+
+                    mu = z.mean(-1, keepdim=True)
+                    sigma = (z.var(-1, unbiased=False, keepdim=True) + ln.eps).sqrt()
+                    u = (hidden_states_n[idx] - beta) / gamma
+                    u_hat = (u - u.mean(-1, keepdim=True)) / u.std(-1, unbiased=False, keepdim=True)
+                    z_target = u_hat * sigma + mu
+
+                    a1_batch = mlp
+                    a2_batch = z_target - residual 
+                else:
+                    a1_batch = hidden_states_mlp[idx].to(dev)
+                    a2_batch = hidden_states_n[idx].to(dev) + hidden_states_mlp[idx].to(dev) - hidden_states_i[idx].to(dev)
             else:
                 a1_batch = hidden_states_i[idx].to(dev)
                 a2_batch = hidden_states_n[idx].to(dev)
@@ -215,7 +263,6 @@ def lstsq(
     extractor.to("cpu")
     extractor.eval()
 
-    # Apply transformations # TODO: Compare with original code if Claude's alterations match
     for i in range(len(selected_blocks)):
         extractor.encoder = truncate_model(extractor.encoder, start_ids[i] - num_layers[i], end_ids[i] - num_layers[i])
         # Fold T into the FFN down-projection of the last kept layer before the cut:

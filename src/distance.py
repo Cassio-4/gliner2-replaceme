@@ -19,11 +19,11 @@ from tqdm import tqdm
 from transformers import BitsAndBytesConfig
 
 from .utils import (compute_block_distances, get_gliner2_calib_dataloader,
-                    get_last_non_padded_tokens,
+                    get_gliner_sep_tokens, get_last_non_padded_tokens,
                     get_text_and_query_indices_tokens, seed_all)
 
 # Accepted values of profile_distances' distance_calculation_tokens
-DISTANCE_CALCULATION_TOKENS = ("first_sub_token", "last_non_pad_token")
+DISTANCE_CALCULATION_TOKENS = ("first_sub_token", "last_non_pad_token", "gliner_sep_token")
 
 # Initialize colorama for Windows compatibility
 init(autoreset=True)
@@ -75,6 +75,8 @@ def profile_distances(
                 word and the schema [E] markers)
             "last_non_pad_token": the last non-padded token of each sequence, as in the
                 original ReplaceMe ([SEP] on DeBERTa)
+            "gliner_sep_token": the [SEP_TEXT] token separating the schemas from the text,
+                one per sequence
     """
     if distance_calculation_tokens not in DISTANCE_CALCULATION_TOKENS:
         raise ValueError(
@@ -138,6 +140,12 @@ def profile_distances(
             selected_hidden_states = get_text_and_query_indices_tokens(
                 hidden_states, batch["text_word_indices"], batch["text_word_mask"],
                 batch["query_marker_indices"], batch["query_marker_mask"],
+            )
+        elif distance_calculation_tokens == "gliner_sep_token":
+            # One token per sequence: the [SEP_TEXT] separating the schemas from the text,
+            # (batch, hidden)
+            selected_hidden_states = get_gliner_sep_tokens(
+                hidden_states, batch["sep_text_indices"]
             )
         elif distance_calculation_tokens == "last_non_pad_token":
             # Original ReplaceMe: one token per sequence, which is [SEP] on DeBERTa

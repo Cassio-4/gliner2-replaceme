@@ -146,7 +146,17 @@ def get_gliner2_calib_dataloader(
 
     def collate(rows):
         batch = collator(rows)
+        # Position of the single [SEP_TEXT] per sequence: GLiNER2's processor tags it as the only
+        # "sep" segment in mapped_indices (it is always appended once, after the schemas, before
+        # the text; max_len truncates text words only, so it is never cut).
+        sep_positions = [
+            [pos for pos, (seg_type, _, _) in enumerate(mapping) if seg_type == "sep"]
+            for mapping in batch.mapped_indices
+        ]
+        if any(len(p) != 1 for p in sep_positions):
+            raise RuntimeError(f"Expected exactly one [SEP_TEXT] per sequence, got {sep_positions}")
         return {
+            "sep_text_indices": torch.tensor([p[0] for p in sep_positions], dtype=torch.long),
             "input_ids": batch.input_ids,
             "attention_mask": batch.attention_mask,
             "text_word_indices": batch.text_word_indices,
@@ -203,7 +213,6 @@ def get_last_non_padded_tokens(
         for layer in hidden_states
     ]
 
-
 def get_text_and_query_indices_tokens(
     hidden_states: List[torch.Tensor],
     text_word_indices: torch.Tensor,
@@ -222,6 +231,20 @@ def get_text_and_query_indices_tokens(
     rows = torch.arange(positions.size(0), device=positions.device).unsqueeze(1).expand_as(positions)
     rows, positions = rows[valid], positions[valid]
     return [layer[rows, positions, :] for layer in hidden_states]
+
+def get_gliner_sep_tokens(
+    hidden_states: List[torch.Tensor],
+    sep_text_indices: torch.Tensor,
+) -> List[torch.Tensor]:
+    """Extract, from each layer, the [SEP_TEXT] token that separates the schemas from the text.
+
+    GLiNER2 builds every input as ``schema [SEP_STRUCT] schema ... [SEP_TEXT] text``, so each
+    sequence holds exactly one [SEP_TEXT]; ``sep_text_indices`` (batch,) gives its position (see
+    ``get_gliner2_calib_dataloader``). Each layer yields a (batch, hidden) tensor, one row per
+    sequence, the same flat layout as ``get_text_and_query_indices_tokens``.
+    """
+    rows = torch.arange(sep_text_indices.size(0), device=sep_text_indices.device)
+    return [layer[rows, sep_text_indices, :] for layer in hidden_states]
 
 
 # --------------------------

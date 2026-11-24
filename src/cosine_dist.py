@@ -32,7 +32,6 @@ def cosine_dist(
     batch_size: int,
     max_length: int,
     layers_to_skip: int,
-    dataset_size: Optional[int] = None,
     dataset_subset: Optional[str] = "dev",
     activations_save_path: Optional[str] = None,
     use_4bit: bool = False,
@@ -62,8 +61,7 @@ def cosine_dist(
         batch_size: Batch size for processing
         max_length: Maximum sequence length
         layers_to_skip: Number of layers to skip
-        dataset_size: Optional size limit for dataset
-        dataset_subset: Subset of dataset to use (train/eval)
+        dataset_subset: Split to calibrate on (train/dev/test); all of its texts are used
         activations_save_path: Path to save activations
         use_4bit: Whether to use 4-bit quantization
         save_path: Path to save transformed model
@@ -111,7 +109,6 @@ def cosine_dist(
         extractor,
         dataset,
         dataset_subset,
-        dataset_size,
         batch_size,
         max_len=max_length
         )
@@ -136,20 +133,24 @@ def cosine_dist(
     
     hidden_size = model.config.hidden_size
 
+    # Upper bound on gathered token rows: every kept batch (drop_last=True) padded to max_length.
+    # Only the first cnt rows are filled; untouched pages of torch.empty are never committed.
+    max_rows = len(dataloader) * batch_size * max_length
+
     a1 = torch.empty(
-        (dataset_size * max_length, model.config.hidden_size),
+        (max_rows, model.config.hidden_size),
         dtype=torch.bfloat16,
         device='cpu'
     )
     a2 = torch.empty(
-        (dataset_size * max_length, model.config.hidden_size),
+        (max_rows, model.config.hidden_size),
         dtype=torch.bfloat16,
         device='cpu'
     )
     if accurate:
         print("ACCURATE MODE IS ON (MORE MEMORY IS NEEDED")
         a3 = torch.empty(
-            (dataset_size * max_length, model.config.hidden_size),
+            (max_rows, model.config.hidden_size),
             dtype=torch.bfloat16,
             device='cpu'
         )
@@ -237,7 +238,7 @@ def cosine_dist(
         os.makedirs('output_models', exist_ok=True)
         save_path = os.path.join(
             "output_models",
-            f"{model_path}_{layers_to_skip}_layers_{start_id}_{end_id}_{dataset}_{dataset_size}".replace("/", "_")
+            f"{model_path}_{layers_to_skip}_layers_{start_id}_{end_id}_{dataset}_{dataset_subset}".replace("/", "_")
         )
     
     # Apply transformation: fold T into layer idx_i's FFN down-projection, so that dense'(x) = dense(x) T.
